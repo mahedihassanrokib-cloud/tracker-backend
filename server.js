@@ -1,9 +1,7 @@
-require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 
-// Define MongoDB Schema directly in server.js to avoid folder upload issues
 const statusSchema = new mongoose.Schema({
   identifier: { type: String, required: true, unique: true, index: true },
   history: { type: [String], default: [] },
@@ -11,108 +9,69 @@ const statusSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now }
 });
 
-// Avoid OverwriteModelError in serverless environments by checking if model exists
 const Status = mongoose.models.Status || mongoose.model('Status', statusSchema);
 
-
 const app = express();
-const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json({ limit: '50mb' })); // Support large JSON payloads during import
+app.use(express.json({ limit: '50mb' }));
 
-// Connect to MongoDB (Serverless check)
-if (mongoose.connection.readyState === 0) {
-  mongoose.connect(process.env.MONGODB_URI)
-    .then(() => console.log('Connected to MongoDB'))
-    .catch((err) => console.error('MongoDB connection error:', err));
+// Helper function to connect to DB before each request in serverless
+async function connectDB() {
+  if (mongoose.connection.readyState >= 1) return;
+  
+  try {
+    const uri = process.env.MONGODB_URI;
+    if (!uri) throw new Error("MONGODB_URI is undefined. Please check Vercel Environment Variables.");
+    
+    await mongoose.connect(uri, { serverSelectionTimeoutMS: 5000 });
+    console.log('Connected to MongoDB');
+  } catch (error) {
+    console.error('MongoDB connection error:', error);
+    throw error;
+  }
 }
 
-// 1. Bulk Update Status (Used during deep sync and live monitor)
+// Test Route
+app.get('/api/test', (req, res) => {
+  res.json({ status: 'Server is running perfectly!' });
+});
+
 app.post('/api/status/bulk-update', async (req, res) => {
   try {
-    const updates = req.body; // Array of { identifier, status }
+    await connectDB();
+    const updates = req.body;
     if (!Array.isArray(updates)) return res.status(400).json({ error: 'Body must be an array' });
 
     const bulkOps = [];
-    
     for (const item of updates) {
       if (!item.identifier || !item.status) continue;
-      
       const cleanStatus = item.status.split('\n')[0].trim();
-      
-      // We want to push to history ONLY if the last status is different.
-      // However, MongoDB doesn't easily let us push conditionally based on the last element in bulk operations natively without aggregation pipelines in updates.
-      // So we will just push it and rely on the frontend to only send updates when a change occurs,
-      // or we can fetch first. For bulk scraping, let's just do a findOneAndUpdate if not exist.
-      // Actually, to make it fast, we can use an update pipeline (MongoDB 4.2+).
       
       bulkOps.push({
         updateOne: {
           filter: { identifier: item.identifier },
           update: [
-            {
-              $set: {
-                // If history is missing, initialize it
-                history: { $cond: [{ $not: ["$history"] }, [], "$history"] },
-                lastStatus: { $cond: [{ $not: ["$lastStatus"] }, "", "$lastStatus"] }
-              }
-            },
-            {
-              $set: {
-                // Only push to history if lastStatus != cleanStatus
-                history: {
-                  $cond: [
-                    { $ne: [{ $arrayElemAt: ["$history", -1] }, cleanStatus] },
-                    { $concatArrays: ["$history", [cleanStatus]] },
-                    "$history"
-                  ]
-                },
-                lastStatus: cleanStatus,
-                updatedAt: new Date()
-              }
-            }
+            { $set: { history: { $cond: [{ $not: ["$history"] }, [], "$history"] }, lastStatus: { $cond: [{ $not: ["$lastStatus"] }, "", "$lastStatus"] } } },
+            { $set: { history: { $cond: [{ $ne: [{ $arrayElemAt: ["$history", -1] }, cleanStatus] }, { $concatArrays: ["$history", [cleanStatus]] }, "$history"] }, lastStatus: cleanStatus, updatedAt: new Date() } }
           ],
           upsert: true
         }
       });
     }
-
-    if (bulkOps.length > 0) {
-      await Status.bulkWrite(bulkOps);
-    }
-    
+    if (bulkOps.length > 0) await Status.bulkWrite(bulkOps);
     res.json({ success: true, count: bulkOps.length });
   } catch (error) {
     console.error('Bulk update error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: error.message || 'Internal server error' });
   }
 });
 
-// 2. Get Stats Dashboard
 app.get('/api/status/stats', async (req, res) => {
   try {
-    // Aggregate counts by lastStatus
-    const stats = await Status.aggregate([
-      {
-        $group: {
-          _id: { $toLower: "$lastStatus" },
-          count: { $sum: 1 }
-        }
-      }
-    ]);
-
-    let results = {
-      editRequired: 0,
-      notSubmit: 0,
-      inReview: 0,
-      incomplete: 0,
-      notCreated: 0,
-      approved: 0,
-      notApproved: 0,
-      hidden: 0
-    };
-
+    await connectDB();
+    const stats = await Status.aggregate([{ $group: { _id: { $toLower: "$lastStatus" }, count: { $sum: 1 } } }]);
+    let results = { editRequired: 0, notSubmit: 0, inReview: 0, incomplete: 0, notCreated: 0, approved: 0, notApproved: 0, hidden: 0 };
     stats.forEach(s => {
       if (!s._id) return;
       if (s._id.includes('edit required')) results.editRequired += s.count;
@@ -124,95 +83,62 @@ app.get('/api/status/stats', async (req, res) => {
       if (s._id.includes('not approved')) results.notApproved += s.count;
       else if (s._id.includes('approved')) results.approved += s.count;
     });
-
     res.json(results);
   } catch (error) {
     console.error('Stats error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: error.message || 'Internal server error' });
   }
 });
 
-// 3. Get history for specific identifiers
 app.post('/api/status/history', async (req, res) => {
   try {
+    await connectDB();
     const { identifiers } = req.body;
     if (!Array.isArray(identifiers)) return res.status(400).json({ error: 'Identifiers must be an array' });
-
     const records = await Status.find({ identifier: { $in: identifiers } });
-    
-    // Convert to map
     const map = {};
-    records.forEach(r => {
-      map[r.identifier] = { history: r.history };
-    });
-
+    records.forEach(r => map[r.identifier] = { history: r.history });
     res.json(map);
   } catch (error) {
     console.error('History fetch error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: error.message || 'Internal server error' });
   }
 });
 
-// 4. Import Backup Data (JSON uploaded from extension)
 app.post('/api/status/import', async (req, res) => {
   try {
-    const data = req.body; // Expecting the format: { "OD_BIO_123": { history: [...] }, ... }
+    await connectDB();
+    const data = req.body;
     const bulkOps = [];
-
     for (const [key, value] of Object.entries(data)) {
       if (key.startsWith('OD_') || key.startsWith('HB_')) {
         const history = value.history || [];
         const lastStatus = history.length > 0 ? history[history.length - 1] : "";
-        
-        bulkOps.push({
-          updateOne: {
-            filter: { identifier: key },
-            update: { 
-              $set: { 
-                identifier: key,
-                history: history,
-                lastStatus: lastStatus,
-                updatedAt: new Date()
-              }
-            },
-            upsert: true
-          }
-        });
+        bulkOps.push({ updateOne: { filter: { identifier: key }, update: { $set: { identifier: key, history: history, lastStatus: lastStatus, updatedAt: new Date() } }, upsert: true } });
       }
     }
-
-    if (bulkOps.length > 0) {
-      await Status.bulkWrite(bulkOps);
-    }
-    
+    if (bulkOps.length > 0) await Status.bulkWrite(bulkOps);
     res.json({ success: true, message: `Imported ${bulkOps.length} records.` });
   } catch (error) {
     console.error('Import error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: error.message || 'Internal server error' });
   }
 });
 
-// 5. Export All Data
 app.get('/api/status/export', async (req, res) => {
   try {
+    await connectDB();
     const allRecords = await Status.find({}, { identifier: 1, history: 1, _id: 0 });
     const exportData = {};
-    allRecords.forEach(r => {
-      exportData[r.identifier] = { history: r.history };
-    });
+    allRecords.forEach(r => exportData[r.identifier] = { history: r.history });
     res.json(exportData);
   } catch (error) {
     console.error('Export error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: error.message || 'Internal server error' });
   }
 });
 
-// For local development
 if (process.env.NODE_ENV !== 'production') {
-  app.listen(PORT, () => {
-    console.log(`Status Tracker backend running on http://localhost:${PORT}`);
-  });
+  app.listen(3000, () => console.log(`Backend running on http://localhost:3000`));
 }
-
-// Export for Vercel Serverless
 module.exports = app;
