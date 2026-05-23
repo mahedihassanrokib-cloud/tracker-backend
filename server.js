@@ -2,7 +2,18 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const Status = require('./models/Status');
+
+// Define MongoDB Schema directly in server.js to avoid folder upload issues
+const statusSchema = new mongoose.Schema({
+  identifier: { type: String, required: true, unique: true, index: true },
+  history: { type: [String], default: [] },
+  lastStatus: { type: String, index: true },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+// Avoid OverwriteModelError in serverless environments by checking if model exists
+const Status = mongoose.models.Status || mongoose.model('Status', statusSchema);
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -10,10 +21,12 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '50mb' })); // Support large JSON payloads during import
 
-// Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch((err) => console.error('MongoDB connection error:', err));
+// Connect to MongoDB (Serverless check)
+if (mongoose.connection.readyState === 0) {
+  mongoose.connect(process.env.MONGODB_URI)
+    .then(() => console.log('Connected to MongoDB'))
+    .catch((err) => console.error('MongoDB connection error:', err));
+}
 
 // 1. Bulk Update Status (Used during deep sync and live monitor)
 app.post('/api/status/bulk-update', async (req, res) => {
@@ -194,6 +207,12 @@ app.get('/api/status/export', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Status Tracker backend running on http://localhost:${PORT}`);
-});
+// For local development
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`Status Tracker backend running on http://localhost:${PORT}`);
+  });
+}
+
+// Export for Vercel Serverless
+module.exports = app;
