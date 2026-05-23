@@ -70,7 +70,13 @@ app.post('/api/status/bulk-update', async (req, res) => {
 app.get('/api/status/stats', async (req, res) => {
   try {
     await connectDB();
-    const stats = await Status.aggregate([{ $group: { _id: { $toLower: "$lastStatus" }, count: { $sum: 1 } } }]);
+    const prefix = req.query.prefix || '';
+    const matchStage = prefix ? { $match: { identifier: { $regex: `^${prefix}` } } } : { $match: {} };
+
+    const stats = await Status.aggregate([
+      matchStage,
+      { $group: { _id: { $toLower: "$lastStatus" }, count: { $sum: 1 } } }
+    ]);
     let results = { editRequired: 0, notSubmit: 0, inReview: 0, incomplete: 0, notCreated: 0, approved: 0, notApproved: 0, hidden: 0 };
     stats.forEach(s => {
       if (!s._id) return;
